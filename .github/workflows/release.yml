@@ -5,36 +5,388 @@ on:
     branches:
       - main
 
-concurrency: ${{ github.workflow }}-${{ github.ref }}
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+# Every job opts into only the permissions it needs. In particular, OIDC is
+# available only to the protected publish job.
+permissions: {}
+
+env:
+  PACKAGE_NAME: vitest-mobile
+  PACKAGE_DIR: packages/vitest-mobile
+  REGISTRY_URL: https://registry.npmjs.org
+  NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
 
 jobs:
-  release:
-    name: Release
+  release-pr:
+    name: Create or update release PR
     runs-on: ubuntu-latest
-    environment: production
     permissions:
-      contents: write
-      pull-requests: write
-      id-token: write
+      contents: write # Changesets commits the version bump through the GitHub API.
+      pull-requests: write # Changesets opens or updates the release pull request.
     steps:
-      - name: Checkout Repo
-        uses: actions/checkout@v4
-
-      - name: Setup Node.js 25.x
-        uses: actions/setup-node@v4
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          node-version: 25.x
-          cache: 'npm'
+          persist-credentials: false
 
-      - name: Install Dependencies
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24.11.1
+          cache: npm
+
+      - name: Install dependencies without lifecycle scripts
+        run: npm ci --ignore-scripts
+
+      - name: Create or update release pull request
+        uses: changesets/action@6a0a831ff30acef54f2c6aa1cbbc1096b066edaf # v1.7.0
+        with:
+          commitMode: github-api
+          github-token: ${{ github.token }}
+          setupGitUser: 'false'
+
+  check-publish:
+    name: Check whether this version needs publishing
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      should_publish: ${{ steps.registry.outputs.should_publish }}
+      version: ${{ steps.registry.outputs.version }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Check the public registry
+        id: registry
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          version="$(jq -er '.version' "$PACKAGE_DIR/package.json")"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "Package version is not a safe npm version." >&2
+            exit 1
+          fi
+
+          encoded_version="$(jq -nr --arg value "$version" '$value | @uri')"
+          status="$(
+            curl --silent --show-error --location \
+              --proto '=https' \
+              --connect-timeout 10 \
+              --max-time 30 \
+              --output "$RUNNER_TEMP/registry-version.json" \
+              --write-out '%{http_code}' \
+              "$REGISTRY_URL/$PACKAGE_NAME/$encoded_version"
+          )"
+
+          case "$status" in
+            200)
+              jq -e --arg name "$PACKAGE_NAME" --arg version "$version" \
+                '.name == $name and .version == $version' \
+                "$RUNNER_TEMP/registry-version.json" >/dev/null
+              should_publish=false
+              ;;
+            404)
+              should_publish=true
+              ;;
+            *)
+              echo "Registry check failed with HTTP $status; refusing to publish." >&2
+              exit 1
+              ;;
+          esac
+
+          printf 'version=%s\n' "$version" >>"$GITHUB_OUTPUT"
+          printf 'should_publish=%s\n' "$should_publish" >>"$GITHUB_OUTPUT"
+
+  prepare:
+    name: Build and inspect package artifact
+    if: needs.check-publish.outputs.should_publish == 'true'
+    needs: check-publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      filename: ${{ steps.package.outputs.filename }}
+      sha256: ${{ steps.package.outputs.sha256 }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24.11.1
+
+      # Dependency and package scripts run here, before any OIDC permission or
+      # protected environment is available.
+      - name: Install dependencies
         run: npm ci
 
-      - name: Create Release Pull Request or Publish to npm
-        id: changesets
-        uses: changesets/action@v1
-        with:
-          publish: npm run release
+      - name: Lint and typecheck
+        run: npm run lint:all
+
+      - name: Run unit and integration tests
+        run: npm test --workspace="$PACKAGE_NAME"
+
+      - name: Build package
+        run: npm run build --workspace="$PACKAGE_NAME"
+
+      - name: Pack and inspect artifact
+        id: package
+        shell: bash
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
-          NPM_CONFIG_PROVENANCE: true
+          EXPECTED_VERSION: ${{ needs.check-publish.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p publish-artifact
+          pack_json="$(npm pack --workspace="$PACKAGE_NAME" --pack-destination publish-artifact --json)"
+          filename="$(
+            printf '%s' "$pack_json" |
+              jq -er 'if length == 1 then .[0].filename else error("expected one tarball") end'
+          )"
+
+          if [[ ! "$filename" =~ ^vitest-mobile-[0-9A-Za-z.-]+\.tgz$ ]]; then
+            echo "npm produced an unexpected tarball name." >&2
+            exit 1
+          fi
+
+          tarball="publish-artifact/$filename"
+          tar -xOzf "$tarball" package/package.json >"$RUNNER_TEMP/package.json"
+          # shellcheck disable=SC2016
+          jq -e \
+            --arg name "$PACKAGE_NAME" \
+            --arg version "$EXPECTED_VERSION" \
+            --arg registry "$REGISTRY_URL/" \
+            '.name == $name and
+             .version == $version and
+             .repository.url == "git+https://github.com/phantom/vitest-mobile.git" and
+             .repository.directory == "packages/vitest-mobile" and
+             .publishConfig.access == "public" and
+             .publishConfig.registry == $registry and
+             .publishConfig.provenance == true' \
+            "$RUNNER_TEMP/package.json" >/dev/null
+
+          tar -tzf "$tarball" >"$RUNNER_TEMP/tar-contents.txt"
+          if grep -Eq '(^|/)(\.npmrc|\.env($|\.)|.*\.(key|pem)|id_(rsa|ed25519))$' \
+            "$RUNNER_TEMP/tar-contents.txt"; then
+            echo "Refusing to publish an artifact containing a sensitive file type." >&2
+            exit 1
+          fi
+
+          size="$(stat --format='%s' "$tarball")"
+          if (( size > 20 * 1024 * 1024 )); then
+            echo "Refusing to publish an unexpectedly large artifact." >&2
+            exit 1
+          fi
+
+          sha256="$(sha256sum "$tarball" | awk '{print $1}')"
+          # shellcheck disable=SC2016
+          jq -n \
+            --arg package "$PACKAGE_NAME" \
+            --arg version "$EXPECTED_VERSION" \
+            --arg filename "$filename" \
+            --arg sha256 "$sha256" \
+            --arg commit "$GITHUB_SHA" \
+            '{package: $package, version: $version, filename: $filename, sha256: $sha256, commit: $commit}' \
+            >publish-artifact/manifest.json
+
+          printf 'filename=%s\n' "$filename" >>"$GITHUB_OUTPUT"
+          printf 'sha256=%s\n' "$sha256" >>"$GITHUB_OUTPUT"
+          {
+            echo '### Package prepared for approval'
+            echo
+            printf -- '- Package: %s@%s\n' "$PACKAGE_NAME" "$EXPECTED_VERSION"
+            printf -- '- Commit: %s\n' "$GITHUB_SHA"
+            printf -- '- SHA-256: %s\n' "$sha256"
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Upload immutable publish artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: npm-publish-artifact
+          path: publish-artifact/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  publish:
+    name: Publish approved artifact to npm
+    if: needs.check-publish.outputs.should_publish == 'true'
+    needs:
+      - check-publish
+      - prepare
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: https://www.npmjs.com/package/vitest-mobile/v/${{ needs.check-publish.outputs.version }}
+    permissions:
+      actions: read # Download the immutable artifact from this workflow run.
+      id-token: write # Exchange GitHub OIDC for short-lived npm publishing access.
+    steps:
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24.11.1
+
+      - name: Download prepared artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: npm-publish-artifact
+          path: publish-artifact
+
+      - name: Verify artifact and npm client
+        id: artifact
+        shell: bash
+        env:
+          EXPECTED_FILENAME: ${{ needs.prepare.outputs.filename }}
+          EXPECTED_SHA256: ${{ needs.prepare.outputs.sha256 }}
+          EXPECTED_VERSION: ${{ needs.check-publish.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          if [[ -n "${NODE_AUTH_TOKEN:-}" || -n "${NPM_TOKEN:-}" || -n "${NPM_AUTH_TOKEN:-}" ]]; then
+            echo "Refusing to publish while a registry token is exposed to the job." >&2
+            exit 1
+          fi
+          if [[ ! "$EXPECTED_FILENAME" =~ ^vitest-mobile-[0-9A-Za-z.-]+\.tgz$ ]]; then
+            echo "Artifact filename is invalid." >&2
+            exit 1
+          fi
+          if [[ ! "$EXPECTED_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "Artifact digest is invalid." >&2
+            exit 1
+          fi
+
+          # shellcheck disable=SC2016
+          jq -e \
+            --arg package "$PACKAGE_NAME" \
+            --arg version "$EXPECTED_VERSION" \
+            --arg filename "$EXPECTED_FILENAME" \
+            --arg sha256 "$EXPECTED_SHA256" \
+            --arg commit "$GITHUB_SHA" \
+            '.package == $package and
+             .version == $version and
+             .filename == $filename and
+             .sha256 == $sha256 and
+             .commit == $commit' \
+            publish-artifact/manifest.json >/dev/null
+
+          actual_sha256="$(sha256sum "publish-artifact/$EXPECTED_FILENAME" | awk '{print $1}')"
+          if [[ "$actual_sha256" != "$EXPECTED_SHA256" ]]; then
+            echo "Artifact digest does not match the approved build." >&2
+            exit 1
+          fi
+
+          npm_version="$(npm --version)"
+          node -e '
+            const [major, minor] = process.argv[1].split(".").map(Number);
+            if (major < 11 || (major === 11 && minor < 5)) process.exit(1);
+          ' "$npm_version" || {
+            echo "Trusted publishing requires npm 11.5.1 or newer." >&2
+            exit 1
+          }
+
+          printf 'registry=%s\nprovenance=true\n' "$REGISTRY_URL" >"$RUNNER_TEMP/npmrc"
+          chmod 600 "$RUNNER_TEMP/npmrc"
+          printf 'filename=%s\n' "$EXPECTED_FILENAME" >>"$GITHUB_OUTPUT"
+
+      # No checkout, dependency install, build, or package lifecycle script is
+      # permitted in this OIDC-enabled job.
+      - name: Publish with npm trusted publishing
+        env:
+          NPM_CONFIG_USERCONFIG: ${{ runner.temp }}/npmrc
+          PUBLISH_FILENAME: ${{ steps.artifact.outputs.filename }}
+        run: >-
+          npm publish "publish-artifact/$PUBLISH_FILENAME"
+          --ignore-scripts
+          --access=public
+          --provenance
+          --registry="$REGISTRY_URL"
+
+  verify:
+    name: Verify registry package and provenance
+    if: needs.check-publish.outputs.should_publish == 'true'
+    needs:
+      - check-publish
+      - prepare
+      - publish
+    runs-on: ubuntu-latest
+    permissions: {}
+    env:
+      EXPECTED_SHA256: ${{ needs.prepare.outputs.sha256 }}
+      EXPECTED_VERSION: ${{ needs.check-publish.outputs.version }}
+    steps:
+      - name: Verify published metadata and tarball
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          metadata="$RUNNER_TEMP/registry-metadata.json"
+          for attempt in {1..12}; do
+            status="$(
+              curl --silent --show-error --location \
+                --proto '=https' \
+                --connect-timeout 10 \
+                --max-time 30 \
+                --output "$metadata" \
+                --write-out '%{http_code}' \
+                "$REGISTRY_URL/$PACKAGE_NAME/$EXPECTED_VERSION"
+            )"
+            if [[ "$status" == 200 ]]; then
+              break
+            fi
+            if [[ "$attempt" == 12 ]]; then
+              echo "Published package was not available for verification." >&2
+              exit 1
+            fi
+            sleep 5
+          done
+
+          # shellcheck disable=SC2016
+          jq -e \
+            --arg name "$PACKAGE_NAME" \
+            --arg version "$EXPECTED_VERSION" \
+            --arg attestation "$REGISTRY_URL/-/npm/v1/attestations/$PACKAGE_NAME@$EXPECTED_VERSION" \
+            '.name == $name and
+             .version == $version and
+             .repository.url == "git+https://github.com/phantom/vitest-mobile.git" and
+             .repository.directory == "packages/vitest-mobile" and
+             .dist.attestations.url == $attestation and
+             .dist.attestations.provenance.predicateType == "https://slsa.dev/provenance/v1"' \
+            "$metadata" >/dev/null
+
+          tarball_url="$(jq -er '.dist.tarball' "$metadata")"
+          expected_url="$REGISTRY_URL/$PACKAGE_NAME/-/$PACKAGE_NAME-$EXPECTED_VERSION.tgz"
+          if [[ "$tarball_url" != "$expected_url" ]]; then
+            echo "Registry returned an unexpected tarball URL." >&2
+            exit 1
+          fi
+
+          curl --fail --silent --show-error --location \
+            --proto '=https' \
+            --connect-timeout 10 \
+            --max-time 60 \
+            --output "$RUNNER_TEMP/published.tgz" \
+            "$tarball_url"
+          actual_sha256="$(sha256sum "$RUNNER_TEMP/published.tgz" | awk '{print $1}')"
+          if [[ "$actual_sha256" != "$EXPECTED_SHA256" ]]; then
+            echo "Registry tarball does not match the approved artifact." >&2
+            exit 1
+          fi
+
+          {
+            echo '### npm publication verified'
+            echo
+            printf -- '- Package: %s@%s\n' "$PACKAGE_NAME" "$EXPECTED_VERSION"
+            printf -- '- SHA-256: %s\n' "$EXPECTED_SHA256"
+            echo '- SLSA provenance attestation: present'
+          } >>"$GITHUB_STEP_SUMMARY"

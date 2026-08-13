@@ -1,0 +1,3 @@
+# Publishing controls must remain under Product Security review.
+/.github/CODEOWNERS @phantom/product-security
+/.github/workflows/release.yml @phantom/product-security
