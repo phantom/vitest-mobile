@@ -98,7 +98,7 @@
     "@vitest/utils": "^4.0.0",
     "react": ">=18",
     "react-native": ">=0.81.5",
-    "vitest": "^4.0.0"
+    "vitest": "^4.1.4"
   },
   "devDependencies": {
     "@types/node": "^25.5.2",
@@ -106,7 +106,7 @@
     "@types/react": "^19.2.14",
     "@types/ws": "^8.5.13",
     "tsup": "^8.5.1",
-    "vitest": "^4.0.0"
+    "vitest": "^4.1.4"
   },
   "codegenConfig": {
     "name": "VitestMobileHarnessSpec",
