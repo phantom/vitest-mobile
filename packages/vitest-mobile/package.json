@@ -4,7 +4,16 @@
   "description": "Run Vitest component tests inside a real React Native app with native touch synthesis",
   "license": "MIT",
   "type": "module",
-  "repository": "https://github.com/pzuraq/vitest-mobile",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/phantom/vitest-mobile.git",
+    "directory": "packages/vitest-mobile"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/",
+    "provenance": true
+  },
   "exports": {
     ".": {
       "types": "./dist/node/index.d.ts",
