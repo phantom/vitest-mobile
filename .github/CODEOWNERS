@@ -1,3 +1,7 @@
 # Publishing controls must remain under Product Security review.
 /.github/CODEOWNERS @phantom/product-security
-/.github/workflows/release.yml @phantom/product-security
+/.github/workflows/** @phantom/product-security
+/.changeset/config.json @phantom/product-security
+/package.json @phantom/product-security
+/package-lock.json @phantom/product-security
+/packages/vitest-mobile/package.json @phantom/product-security
