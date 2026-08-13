@@ -176,7 +176,7 @@ jobs:
             "$RUNNER_TEMP/package.json" >/dev/null
 
           tar -tzf "$tarball" >"$RUNNER_TEMP/tar-contents.txt"
-          if grep -Eq '(^|/)(\.npmrc|\.env($|\..*)|.*\.(key|pem)|id_(rsa|ed25519))$' \
+          if grep -Eq '(^|/)(\.npmrc($|\..*)|\.env($|\..*)|.*\.(key|pem)|id_(rsa|ed25519))$' \
             "$RUNNER_TEMP/tar-contents.txt"; then
             echo "Refusing to publish an artifact containing a sensitive file type." >&2
             exit 1
