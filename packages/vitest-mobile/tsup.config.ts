@@ -10,7 +10,8 @@ export default defineConfig([
       'node/device': 'src/node/device/index.ts',
     },
     format: ['esm', 'cjs'],
-    dts: false,
+    // Only the root entry is public API for TypeScript consumers (`exports["."].types`).
+    dts: { entry: { 'node/index': 'src/node/index.ts' } },
     outDir: 'dist',
     target: 'node18',
     platform: 'node',
