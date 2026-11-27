@@ -7,9 +7,14 @@
   "repository": "https://github.com/pzuraq/vitest-mobile",
   "exports": {
     ".": {
-      "types": "./dist/node/index.d.ts",
-      "import": "./dist/node/index.js",
-      "require": "./dist/node/index.cjs"
+      "import": {
+        "types": "./dist/node/index.d.ts",
+        "default": "./dist/node/index.js"
+      },
+      "require": {
+        "types": "./dist/node/index.d.cts",
+        "default": "./dist/node/index.cjs"
+      }
     },
     "./runtime": {
       "types": "./src/runtime/index.ts",
